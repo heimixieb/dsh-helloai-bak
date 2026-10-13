@@ -140,7 +140,7 @@ async function listProfiles(root: string): Promise<ProfileContext[]> {
 }
 
 /** Reads every dependency declaration that points at a path outside the profile. */
-function declaredLinks(profile: ProfileContext): PluginLink[] {
+async function declaredLinks(profile: ProfileContext): Promise<PluginLink[]> {
   const links: PluginLink[] = [];
   for (const section of DEPENDENCY_SECTIONS) {
     const deps = profile.packageJson?.[section];
@@ -148,7 +148,19 @@ function declaredLinks(profile: ProfileContext): PluginLink[] {
     for (const [linkName, spec] of Object.entries(deps)) {
       const path = pathFromLocalSpec(profile.root, spec);
       if (!path) continue;
-      links.push({ profile: profile.name, linkName, path, target: String(spec), kind: "directory", origin: "declared", declared: true, section, spec: String(spec), exists: true });
+      // Classify by the TARGET, never by the dependency section: a `file:` spec may
+      // point at a packed tarball (.tgz), which has no package.json of its own.
+      // Recording that as "directory" made discoverPlugins mark the plugin
+      // "directory", so packagePluginPayload read the tarball through
+      // collectDirectoryWithStats(): the file's relative name came out empty and was
+      // prefixed into `external/NNN-<slug>/` — a trailing-slash (directory) entry
+      // holding the tarball bytes. Restore recreated an empty directory from that
+      // entry and the tarball was silently lost. linkedPlugins/bundleLinks already
+      // classify by the target for the same reason (on Windows a junction reports
+      // as a symlink, so lstat() cannot answer this).
+      const targetInfo = await stat(path).catch(() => undefined);
+      const kind: "directory" | "file" = targetInfo && !targetInfo.isDirectory() ? "file" : "directory";
+      links.push({ profile: profile.name, linkName, path, target: String(spec), kind, origin: "declared", declared: true, section, spec: String(spec), exists: true });
     }
   }
   return links;
@@ -223,7 +235,7 @@ async function bundleLinks(profile: ProfileContext): Promise<PluginLink[]> {
 async function discoverPlugins(root: string): Promise<LocalPlugin[]> {
   const profiles = await listProfiles(root);
   const all: PluginLink[] = [];
-  for (const profile of profiles) all.push(...declaredLinks(profile), ...await linkedPlugins(profile), ...await bundleLinks(profile));
+  for (const profile of profiles) all.push(...await declaredLinks(profile), ...await linkedPlugins(profile), ...await bundleLinks(profile));
 
   const grouped = new Map<string, { source: string; links: PluginLink[] }>();
   const insideHome = new Map<string, { source: string; links: PluginLink[] }>();
@@ -873,7 +885,7 @@ async function ensureProfileLinks(root: string, plugins: readonly LocalPlugin[],
   const profileNames = new Set<string>();
   for (const profile of await listProfiles(root)) {
     profileNames.add(profile.name);
-    for (const link of declaredLinks(profile)) {
+    for (const link of await declaredLinks(profile)) {
       const target = link.linkName === SELF_PACKAGE ? currentPluginRoot() : targetOf(link.path);
       request.set(`${profile.name}|${link.linkName}`, { profile: profile.name, packageName: link.linkName, target });
     }
